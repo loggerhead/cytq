@@ -1,61 +1,64 @@
-# coding=utf-8
+# -*- coding: utf-8 -*-
+from __future__ import unicode_literals
 import sys
+import datetime
 from workflow import Workflow3, notify
+from cyapi import request_api_if_need
+from data import *
 
-log = None
+def render_realtime(data):
+  result = data['result']['realtime']
+  weather = get_weather(result['skycon'])
 
+  title = u'现在  %.0f°C %s ' % (result['temperature'], weather)
+  subtitle = u'湿度 %.0f%% | 空气质量%s | PM2.5 %.0f' % (
+      result['humidity'] * 100,
+      result['air_quality']['description']['chn'],
+      result['air_quality']['pm25']
+  )
+
+  wf.add_item(subtitle=subtitle, title=title, icon='icon.png')
+
+def render_hourly(data):
+  result = data['result']['hourly']
+  description = result['description']
+  skycons = result['skycon']
+  temperatures = result['temperature']
+
+  def iter_after_now(items):
+    now = datetime.datetime.now()
+    today = datetime.datetime(now.year, now.month, now.day + 1)
+
+    filtered = {}
+    for item in items:
+      dtstr = item['datetime'].split('+')[0]
+      dt = datetime.datetime.strptime(dtstr, '%Y-%m-%dT%H:%M')
+      if dt > today:
+        continue
+      filtered[dt] = item
+    return filtered
+
+  skycons = iter_after_now(skycons)
+  temperatures = iter_after_now(temperatures)
+
+  tt = sorted(skycons.keys())
+  for i in range(len(tt))[::2]:
+    def gen_title(t):
+      skycon = skycons[t]
+      temperature = temperatures.get(t, {}).get('value', '')
+      weather = get_weather(skycon['value'])
+      title = '%02d:00 %.0f°C %s' % (t.hour, temperature, weather)
+      return title
+
+    title = gen_title(tt[i])
+    subtitle = gen_title(tt[i + 1]) if i + 1 < len(tt) else ''
+    wf.add_item(title=title, subtitle=subtitle, icon='icon.png')
 
 def main(wf):
-	import cPickle
-	from data import Data
-	from workflow import web
-
-	city = wf.stored_data('cy-city')
-	api_key = wf.get_password('apiKey')
-
-	if city is None:
-		wf.add_item(u'请通过cy-opt 设置所在城市')
-		wf.send_feedback()
-		return
-	if api_key is None:
-		api_key = u'TAkhjf8d1nlSlspN'
-
-	city_name = city[1]
-
-	url = u'https://api.caiyunapp.com/v2/' + api_key + u'/' + city[5] + u',' + city[4] + u'/realtime.json'
-	log.debug(url)
-	r = web.get(url)
-	data = r.json()
-	log.debug(data)
-	if 'ok' == data['status']:
-		result = data['result']
-		item = Data.weather_dict.get(result['skycon'])
-		wf.add_item(subtitle=city_name + u'天气', title=item.get('name'), icon=item.get('icon'))
-		wf.add_item(subtitle=u'相对湿度' + str(result['humidity'] * 100) + u'%',
-					title=u'温度' + str(result['temperature']) + u'°',
-					icon='assets/thermometer.png')
-		wd = result['wind']['direction']
-		ws = result['wind']['speed']
-		set_wind_item(wd, ws)
-		wf.add_item(u'空气质量指数' + str(result['aqi']), subtitle=u'PM2.5 ' + str(result['pm25']), icon='icon.png')
-	wf.send_feedback()
-
-
-def set_wind_item(wd, ws):
-	from data import Data
-	if ws <= 2:
-		wf.add_item(icon=u'assets/wind-sign.png', title=u'无风')
-	else:
-		wf.add_item(icon=u'assets/wind-sign-1.png', title=Data.get_wind_direction(wd),
-					subtitle=Data.get_wind_speed(ws) + u'\t' + str(ws) + u'公里/小时')
-
+  request_api_if_need(wf, 'realtime', render_realtime)
+  request_api_if_need(wf, 'hourly', render_hourly)
+  wf.send_feedback()
 
 if __name__ == '__main__':
-	# Create a global `Workflow` object
-	wf = Workflow3()
-	# Call your entry function via `Workflow.run()` to enable its helper
-	# functions, like exception catching, ARGV normalization, magic
-	# arguments etc.
-	log = wf.logger
-
-	sys.exit(wf.run(main))
+  wf = Workflow3()
+  sys.exit(wf.run(main))

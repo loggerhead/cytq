@@ -1,71 +1,58 @@
 # coding=utf-8
 import sys
 
+MIN = -sys.maxint - 1
+MAX = sys.maxint
 
-# init datas
-class Data:
-	def __init__(self):
-		pass
+def get_weather(name):
+  data = {
+      'clear_day': u'晴天',
+      'clear_night': u'晴夜',
+      'partly_cloudy_day': u'多云',
+      'partly_cloudy_night': u'多云',
+      'cloudy': u'阴',
+      'rain': u'雨',
+      'snow': u'雪',
+      'wind': u'风',
+      'fog': u'雾',
+      'haze': u'霾',
+      'sleet': u'冻雨',
+  }
+  name = name.lower()
+  return data.get(name, name)
 
-	weather_dict = {u'CLEAR_DAY': {u'name': u'晴天', u'icon': u'assets/sun-3.png'},
-					u'CLEAR_NIGHT': {u'name': u'晴夜', u'icon': u'assets/moon-1.png'},
-					u'PARTLY_CLOUDY_DAY': {u'name': u'多云', u'icon': u'assets/cloudy.png'},
-					u'PARTLY_CLOUDY_NIGHT': {u'name': u'多云', u'icon': u'assets/cloudy-night.png'},
-					u'CLOUDY': {u'name': u'阴', u'icon': u'assets/cloud.png'},
-					u'RAIN': {u'name': u'雨', u'icon': u'assets/rain-1.png'},
-					u'SNOW': {u'name': u'雪', u'icon': u'assets/snow.png'},
-					u'WIND': {u'name': u'风', u'icon': u'assets/windy.png'},
-					u'FOG': {u'name': u'雾', u'icon': u'assets/fogg.png'}, u'HAZE': {u'name': u'霾'},
-					u'SLEET': {u'name': u'冻雨'}}
+def get_wind_direction(wd):
+  data = {
+    (MIN, 22.5): u'北风',
+    (22.5, 67.5): u'东北风',
+    (67.5, 112.5): u'东风',
+    (112.5, 157.5): u'东南风',
+    (157.5, 202.5): u'南风',
+    (202.5, 247.5): u'西南风',
+    (247.5, 292.5): u'西风',
+    (292.5, 337.5): u'西北风',
+    (337.5, MAX): u'北风',
+  }
+  for l, r in data.keys():
+    if l < wd <= r:
+      return data[k]
 
-	@staticmethod
-	def get_wind_direction(wd):
-		if wd <= 22.5 or wd > 337.5:
-			return u'北风'
-		elif 22.5 < wd <= 67.5:
-			return u'东北风'
-		elif 67.5 < wd <= 112.5:
-			return u'东风'
-		elif 112.5 < wd <= 157.5:
-			return u'东南风'
-		elif 157.5 < wd <= 202.5:
-			return u'南风'
-		elif 202.5 < wd <= 247.5:
-			return u'西南风'
-		elif 247.5 < wd <= 292.5:
-			return u'西风'
-		elif 292.5 < wd <= 337.5:
-			return u'西北风'
-
-	@staticmethod
-	def get_wind_speed(ws):
-		if ws <= 2:
-			return u'无风'
-		if 2 < ws <= 6:
-			return u'软风'
-		elif 6 < ws <= 12:
-			return u'轻风'
-		elif 12 < ws <= 19:
-			return u'缓风'
-		elif 19 < ws <= 30:
-			return u'和风'
-		elif 30 < ws <= 40:
-			return u'清风'
-		elif 40 < ws <= 51:
-			return u'强风'
-		elif 51 < ws <= 62:
-			return u'疾风'
-		elif 62 < ws <= 75:
-			return u'烈风'
-		elif 75 < ws <= 87:
-			return u'增强烈风'
-		elif 87 < ws <= 103:
-			return u'暴风'
-		elif 103 < ws <= 149:
-			return u'台风'
-		elif 149 < ws <= 183:
-			return u'强台飓风'
-		elif 183 < ws <= 220:
-			return u'超强台飓风'
-		else:
-			return u'极强台飓风'
+def get_wind_speed(ws):
+  data = {
+      (MIN, 2): u'无风',
+      (2, 6): u'软风',
+      (6, 12): u'轻风',
+      (12, 19): u'缓风',
+      (19, 30): u'和风',
+      (30, 40): u'清风',
+      (40, 51): u'强风',
+      (51, 62): u'疾风',
+      (62, 75): u'烈风',
+      (75, 87): u'增强烈风',
+      (87, 103): u'暴风',
+      (103, 149): u'台风',
+      (149, MAX): u'出门就被风吹走',
+  }
+  for l, r in data.keys():
+    if l < ws <= r:
+      return data[k]

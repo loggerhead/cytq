@@ -1,24 +1,24 @@
 # coding=utf-8
 import sys
-import csv
+import subprocess
 from workflow import Workflow3, notify
 
-log = None
-
-
 def main(wf):
-	# Get args from Workflow, already in normalized Unicode
-	args = wf.args
+  log = wf.logger
+  args = wf.args
+  api_key = args[0]
 
-	wf.save_password('apiKey', args[0])
+  # https://github.com/robmathers/WhereAmI/releases
+  geoinfo = subprocess.check_output(["/usr/local/bin/whereami"])
+  for line in geoinfo.split('\n'):
+    line = line.lower().strip()
+    if line.startswith('latitude'):
+      wf.store_data('latitude', line.split()[-1])
+    if line.startswith('longitude'):
+      wf.store_data('longitude', line.split()[-1])
 
+  wf.save_password('apiKey', api_key)
 
 if __name__ == '__main__':
-	# Create a global `Workflow` object
-	wf = Workflow3()
-	# Call your entry function via `Workflow.run()` to enable its helper
-	# functions, like exception catching, ARGV normalization, magic
-	# arguments etc.
-	log = wf.logger
-
-	sys.exit(wf.run(main))
+  wf = Workflow3()
+  sys.exit(wf.run(main))

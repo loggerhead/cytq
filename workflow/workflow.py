@@ -10,7 +10,7 @@
 """The :class:`Workflow` object is the main interface to this library.
 
 :class:`Workflow` is targeted at Alfred 2. Use
-:class:`~workflow.Workflow3` if you want to use Alfred 3's new
+:class:`~workflow.workflow3.Workflow3` if you want to use Alfred 3's new
 features, such as :ref:`workflow variables <workflow-variables>` or
 more powerful modifiers.
 
@@ -21,9 +21,12 @@ up your Python script to best utilise the :class:`Workflow` object.
 
 from __future__ import print_function, unicode_literals
 
+import atexit
 import binascii
+from contextlib import contextmanager
 import cPickle
 from copy import deepcopy
+import errno
 import json
 import logging
 import logging.handlers
@@ -32,6 +35,7 @@ import pickle
 import plistlib
 import re
 import shutil
+import signal
 import string
 import subprocess
 import sys
@@ -43,12 +47,6 @@ try:
 except ImportError:  # pragma: no cover
     import xml.etree.ElementTree as ET
 
-from util import (
-    AcquisitionError,  # imported to maintain API
-    atomic_writer,
-    LockFile,
-    uninterruptible,
-)
 
 #: Sentinel for properties that haven't been set yet (that might
 #: correctly have the value ``None``)
@@ -58,7 +56,7 @@ UNSET = object()
 # Standard system icons
 ####################################################################
 
-# These icons are default macOS icons. They are super-high quality, and
+# These icons are default OS X icons. They are super-high quality, and
 # will be familiar to users.
 # This library uses `ICON_ERROR` when a workflow dies in flames, so
 # in my own workflows, I use `ICON_WARNING` for less fatal errors
@@ -445,8 +443,11 @@ DEFAULT_UPDATE_FREQUENCY = 1
 
 
 ####################################################################
-# Keychain access errors
+# Lockfile and Keychain access errors
 ####################################################################
+
+class AcquisitionError(Exception):
+    """Raised if a lock cannot be acquired."""
 
 
 class KeychainError(Exception):
@@ -455,7 +456,6 @@ class KeychainError(Exception):
     Raised by methods :meth:`Workflow.save_password`,
     :meth:`Workflow.get_password` and :meth:`Workflow.delete_password`
     when ``security`` CLI app returns an unknown error code.
-
     """
 
 
@@ -464,7 +464,6 @@ class PasswordNotFound(KeychainError):
 
     Raised by method :meth:`Workflow.get_password` when ``account``
     is unknown to the Keychain.
-
     """
 
 
@@ -474,7 +473,6 @@ class PasswordExists(KeychainError):
     You should never receive this error: it is used internally
     by the :meth:`Workflow.save_password` method to know if it needs
     to delete the old password first (a Keychain implementation detail).
-
     """
 
 
@@ -508,13 +506,13 @@ class SerializerManager(object):
     .. versionadded:: 1.8
 
     A configured instance of this class is available at
-    :attr:`workflow.manager`.
+    ``workflow.manager``.
 
     Use :meth:`register()` to register new (or replace
     existing) serializers, which you can specify by name when calling
-    :class:`~workflow.Workflow` data storage methods.
+    :class:`Workflow` data storage methods.
 
-    See :ref:`guide-serialization` and :ref:`guide-persistent-data`
+    See :ref:`manual-serialization` and :ref:`manual-persistent-data`
     for further information.
 
     """
@@ -798,6 +796,187 @@ class Item(object):
         return root
 
 
+class LockFile(object):
+    """Context manager to create lock files."""
+
+    def __init__(self, protected_path, timeout=0, delay=0.05):
+        """Create new :class:`LockFile` object."""
+        self.lockfile = protected_path + '.lock'
+        self.timeout = timeout
+        self.delay = delay
+        self._locked = False
+        atexit.register(self.release)
+
+    @property
+    def locked(self):
+        """`True` if file is locked by this instance."""
+        return self._locked
+
+    def acquire(self, blocking=True):
+        """Acquire the lock if possible.
+
+        If the lock is in use and ``blocking`` is ``False``, return
+        ``False``.
+
+        Otherwise, check every `self.delay` seconds until it acquires
+        lock or exceeds `self.timeout` and raises an `~AcquisitionError`.
+
+        """
+        start = time.time()
+        while True:
+
+            self._validate_lockfile()
+
+            try:
+                fd = os.open(self.lockfile, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                with os.fdopen(fd, 'w') as fd:
+                    fd.write('{0}'.format(os.getpid()))
+                break
+            except OSError as err:
+                if err.errno != errno.EEXIST:  # pragma: no cover
+                    raise
+
+                if self.timeout and (time.time() - start) >= self.timeout:
+                    raise AcquisitionError('Lock acquisition timed out.')
+                if not blocking:
+                    return False
+                time.sleep(self.delay)
+
+        self._locked = True
+        return True
+
+    def _validate_lockfile(self):
+        """Check existence and validity of lockfile.
+
+        If the lockfile exists, but contains an invalid PID
+        or the PID of a non-existant process, it is removed.
+
+        """
+        try:
+            with open(self.lockfile) as fp:
+                s = fp.read()
+        except Exception:
+            return
+
+        try:
+            pid = int(s)
+        except ValueError:
+            return self.release()
+
+        from background import _process_exists
+        if not _process_exists(pid):
+            self.release()
+
+    def release(self):
+        """Release the lock by deleting `self.lockfile`."""
+        self._locked = False
+        try:
+            os.unlink(self.lockfile)
+        except (OSError, IOError) as err:  # pragma: no cover
+            if err.errno != 2:
+                raise err
+
+    def __enter__(self):
+        """Acquire lock."""
+        self.acquire()
+        return self
+
+    def __exit__(self, typ, value, traceback):
+        """Release lock."""
+        self.release()
+
+    def __del__(self):
+        """Clear up `self.lockfile`."""
+        if self._locked:  # pragma: no cover
+            self.release()
+
+
+@contextmanager
+def atomic_writer(file_path, mode):
+    """Atomic file writer.
+
+    :param file_path: path of file to write to.
+    :type file_path: ``unicode``
+    :param mode: sames as for `func:open`
+    :type mode: string
+
+    .. versionadded:: 1.12
+
+    Context manager that ensures the file is only written if the write
+    succeeds. The data is first written to a temporary file.
+
+    """
+    temp_suffix = '.aw.temp'
+    temp_file_path = file_path + temp_suffix
+    with open(temp_file_path, mode) as file_obj:
+        try:
+            yield file_obj
+            os.rename(temp_file_path, file_path)
+        finally:
+            try:
+                os.remove(temp_file_path)
+            except (OSError, IOError):
+                pass
+
+
+class uninterruptible(object):
+    """Decorator that postpones SIGTERM until wrapped function is complete.
+
+    .. versionadded:: 1.12
+
+    Since version 2.7, Alfred allows Script Filters to be killed. If
+    your workflow is killed in the middle of critical code (e.g.
+    writing data to disk), this may corrupt your workflow's data.
+
+    Use this decorator to wrap critical functions that *must* complete.
+    If the script is killed while a wrapped function is executing,
+    the SIGTERM will be caught and handled after your function has
+    finished executing.
+
+    Alfred-Workflow uses this internally to ensure its settings, data
+    and cache writes complete.
+
+    .. important::
+
+        This decorator is NOT thread-safe.
+
+    """
+
+    def __init__(self, func, class_name=''):
+        """Decorate `func`."""
+        self.func = func
+        self._caught_signal = None
+
+    def signal_handler(self, signum, frame):
+        """Called when process receives SIGTERM."""
+        self._caught_signal = (signum, frame)
+
+    def __call__(self, *args, **kwargs):
+        """Trap ``SIGTERM`` and call wrapped function."""
+        self._caught_signal = None
+        # Register handler for SIGTERM, then call `self.func`
+        self.old_signal_handler = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, self.signal_handler)
+
+        self.func(*args, **kwargs)
+
+        # Restore old signal handler
+        signal.signal(signal.SIGTERM, self.old_signal_handler)
+
+        # Handle any signal caught during execution
+        if self._caught_signal is not None:
+            signum, frame = self._caught_signal
+            if callable(self.old_signal_handler):
+                self.old_signal_handler(signum, frame)
+            elif self.old_signal_handler == signal.SIG_DFL:
+                sys.exit(0)
+
+    def __get__(self, obj=None, klass=None):
+        """Decorator API."""
+        return self.__class__(self.func.__get__(obj, klass),
+                              klass.__name__)
+
+
 class Settings(dict):
     """A dictionary that saves itself when changed.
 
@@ -831,15 +1010,13 @@ class Settings(dict):
 
     def _load(self):
         """Load cached settings from JSON file `self._filepath`."""
-        data = {}
-        with LockFile(self._filepath, 0.5):
-            with open(self._filepath, 'rb') as fp:
-                data.update(json.load(fp))
-
-        self._original = deepcopy(data)
-
         self._nosave = True
-        self.update(data)
+        d = {}
+        with open(self._filepath, 'rb') as file_obj:
+            for key, value in json.load(file_obj, encoding='utf-8').items():
+                d[key] = value
+        self.update(d)
+        self._original = deepcopy(d)
         self._nosave = False
 
     @uninterruptible
@@ -852,13 +1029,13 @@ class Settings(dict):
         """
         if self._nosave:
             return
-
         data = {}
         data.update(self)
-
-        with LockFile(self._filepath, 0.5):
-            with atomic_writer(self._filepath, 'wb') as fp:
-                json.dump(data, fp, sort_keys=True, indent=2,
+        # for key, value in self.items():
+        #     data[key] = value
+        with LockFile(self._filepath):
+            with atomic_writer(self._filepath, 'wb') as file_obj:
+                json.dump(data, file_obj, sort_keys=True, indent=2,
                           encoding='utf-8')
 
     # dict methods
@@ -886,36 +1063,27 @@ class Settings(dict):
 
 
 class Workflow(object):
-    """The ``Workflow`` object is the main interface to Alfred-Workflow.
-
-    It provides APIs for accessing the Alfred/workflow environment,
-    storing & caching data, using Keychain, and generating Script
-    Filter feedback.
-
-    ``Workflow`` is compatible with both Alfred 2 and 3. The
-    :class:`~workflow.Workflow3` subclass provides additional,
-    Alfred 3-only features, such as workflow variables.
+    """Create new :class:`Workflow` instance.
 
     :param default_settings: default workflow settings. If no settings file
         exists, :class:`Workflow.settings` will be pre-populated with
         ``default_settings``.
     :type default_settings: :class:`dict`
-    :param update_settings: settings for updating your workflow from
-        GitHub releases. The only required key is ``github_slug``,
-        whose value must take the form of ``username/repo``.
-        If specified, ``Workflow`` will check the repo's releases
-        for updates. Your workflow must also have a semantic version
-        number. Please see the :ref:`User Manual <user-manual>` and
-        `update API docs <api-updates>` for more information.
+    :param update_settings: settings for updating your workflow from GitHub.
+        This must be a :class:`dict` that contains ``github_slug`` and
+        ``version`` keys. ``github_slug`` is of the form ``username/repo``
+        and ``version`` **must** correspond to the tag of a release. The
+        boolean ``prereleases`` key is optional and if ``True`` will
+        override the :ref:`magic argument <magic-arguments>` preference.
+        This is only recommended when the installed workflow is a pre-release.
+        See :ref:`updates` for more information.
     :type update_settings: :class:`dict`
-    :param input_encoding: encoding of command line arguments. You
-        should probably leave this as the default (``utf-8``), which
-        is the encoding Alfred uses.
+    :param input_encoding: encoding of command line arguments
     :type input_encoding: :class:`unicode`
     :param normalization: normalisation to apply to CLI args.
         See :meth:`Workflow.decode` for more details.
     :type normalization: :class:`unicode`
-    :param capture_args: Capture and act on ``workflow:*`` arguments. See
+    :param capture_args: capture and act on ``workflow:*`` arguments. See
         :ref:`Magic arguments <magic-arguments>` for details.
     :type capture_args: :class:`Boolean`
     :param libraries: sequence of paths to directories containing
@@ -1008,32 +1176,32 @@ class Workflow(object):
         ============================  =========================================
         Variable                      Description
         ============================  =========================================
-        debug                         Set to ``1`` if Alfred's debugger is
+        alfred_debug                  Set to ``1`` if Alfred's debugger is
                                       open, otherwise unset.
-        preferences                   Path to Alfred.alfredpreferences
+        alfred_preferences            Path to Alfred.alfredpreferences
                                       (where your workflows and settings are
                                       stored).
-        preferences_localhash         Machine-specific preferences are stored
+        alfred_preferences_localhash  Machine-specific preferences are stored
                                       in ``Alfred.alfredpreferences/preferences/local/<hash>``
-                                      (see ``preferences`` above for
+                                      (see ``alfred_preferences`` above for
                                       the path to ``Alfred.alfredpreferences``)
-        theme                         ID of selected theme
-        theme_background              Background colour of selected theme in
+        alfred_theme                  ID of selected theme
+        alfred_theme_background       Background colour of selected theme in
                                       format ``rgba(r,g,b,a)``
-        theme_subtext                 Show result subtext.
+        alfred_theme_subtext          Show result subtext.
                                       ``0`` = Always,
                                       ``1`` = Alternative actions only,
                                       ``2`` = Selected result only,
                                       ``3`` = Never
-        version                       Alfred version number, e.g. ``'2.4'``
-        version_build                 Alfred build number, e.g. ``277``
-        workflow_bundleid             Bundle ID, e.g.
+        alfred_version                Alfred version number, e.g. ``'2.4'``
+        alfred_version_build          Alfred build number, e.g. ``277``
+        alfred_workflow_bundleid      Bundle ID, e.g.
                                       ``net.deanishe.alfred-mailto``
-        workflow_cache                Path to workflow's cache directory
-        workflow_data                 Path to workflow's data directory
-        workflow_name                 Name of current workflow
-        workflow_uid                  UID of workflow
-        workflow_version              The version number specified in the
+        alfred_workflow_cache         Path to workflow's cache directory
+        alfred_workflow_data          Path to workflow's data directory
+        alfred_workflow_name          Name of current workflow
+        alfred_workflow_uid           UID of workflow
+        alfred_workflow_version       The version number specified in the
                                       workflow configuration sheet/info.plist
         ============================  =========================================
 
@@ -1388,12 +1556,9 @@ class Workflow(object):
             return self._logger
 
         # Initialise new logger and optionally handlers
-        logger = logging.getLogger('')
+        logger = logging.getLogger('workflow')
 
-        # Only add one set of handlers
-        # Exclude from coverage, as pytest will have configured the
-        # root logger already
-        if not len(logger.handlers):  # pragma: no cover
+        if not len(logger.handlers):  # Only add one set of handlers
 
             fmt = logging.Formatter(
                 '%(asctime)s %(filename)s:%(lineno)s'
@@ -1446,7 +1611,7 @@ class Workflow(object):
     def settings(self):
         """Return a dictionary subclass that saves itself when changed.
 
-        See :ref:`guide-settings` in the :ref:`user-manual` for more
+        See :ref:`manual-settings` in the :ref:`user-manual` for more
         information on how to use :attr:`settings` and **important
         limitations** on what it can do.
 
@@ -1459,7 +1624,8 @@ class Workflow(object):
 
         """
         if not self._settings:
-            self.logger.debug('reading settings from %s', self.settings_path)
+            self.logger.debug('Reading settings from `{0}` ...'.format(
+                              self.settings_path))
             self._settings = Settings(self.settings_path,
                                       self._default_settings)
         return self._settings
@@ -1503,7 +1669,8 @@ class Workflow(object):
                 'Unknown serializer : `{0}`. Register your serializer '
                 'with `manager` first.'.format(serializer_name))
 
-        self.logger.debug('default cache serializer: %s', serializer_name)
+        self.logger.debug(
+            'default cache serializer set to `{0}`'.format(serializer_name))
 
         self._cache_serializer = serializer_name
 
@@ -1545,7 +1712,8 @@ class Workflow(object):
                 'Unknown serializer : `{0}`. Register your serializer '
                 'with `manager` first.'.format(serializer_name))
 
-        self.logger.debug('default data serializer: %s', serializer_name)
+        self.logger.debug(
+            'default data serializer set to `{0}`'.format(serializer_name))
 
         self._data_serializer = serializer_name
 
@@ -1562,7 +1730,7 @@ class Workflow(object):
         metadata_path = self.datafile('.{0}.alfred-workflow'.format(name))
 
         if not os.path.exists(metadata_path):
-            self.logger.debug('no data stored for `%s`', name)
+            self.logger.debug('No data stored for `{0}`'.format(name))
             return None
 
         with open(metadata_path, 'rb') as file_obj:
@@ -1576,13 +1744,14 @@ class Workflow(object):
                 'serializer with `manager.register()` '
                 'to load this data.'.format(serializer_name))
 
-        self.logger.debug('data `%s` stored as `%s`', name, serializer_name)
+        self.logger.debug('Data `{0}` stored in `{1}` format'.format(
+            name, serializer_name))
 
         filename = '{0}.{1}'.format(name, serializer_name)
         data_path = self.datafile(filename)
 
         if not os.path.exists(data_path):
-            self.logger.debug('no data stored: %s', name)
+            self.logger.debug('No data stored for `{0}`'.format(name))
             if os.path.exists(metadata_path):
                 os.unlink(metadata_path)
 
@@ -1591,7 +1760,7 @@ class Workflow(object):
         with open(data_path, 'rb') as file_obj:
             data = serializer.load(file_obj)
 
-        self.logger.debug('stored data loaded: %s', data_path)
+        self.logger.debug('Stored data loaded from : {0}'.format(data_path))
 
         return data
 
@@ -1620,7 +1789,7 @@ class Workflow(object):
             for path in paths:
                 if os.path.exists(path):
                     os.unlink(path)
-                    self.logger.debug('deleted data file: %s', path)
+                    self.logger.debug('Deleted data file : {0}'.format(path))
 
         serializer_name = serializer or self.data_serializer
 
@@ -1660,7 +1829,7 @@ class Workflow(object):
 
         _store()
 
-        self.logger.debug('saved data: %s', data_path)
+        self.logger.debug('Stored data saved at : {0}'.format(data_path))
 
     def cached_data(self, name, data_func=None, max_age=60):
         """Return cached data if younger than ``max_age`` seconds.
@@ -1686,7 +1855,8 @@ class Workflow(object):
         if (age < max_age or max_age == 0) and os.path.exists(cache_path):
 
             with open(cache_path, 'rb') as file_obj:
-                self.logger.debug('loading cached data: %s', cache_path)
+                self.logger.debug('Loading cached data from : %s',
+                                  cache_path)
                 return serializer.load(file_obj)
 
         if not data_func:
@@ -1715,13 +1885,13 @@ class Workflow(object):
         if data is None:
             if os.path.exists(cache_path):
                 os.unlink(cache_path)
-                self.logger.debug('deleted cache file: %s', cache_path)
+                self.logger.debug('Deleted cache file : %s', cache_path)
             return
 
         with atomic_writer(cache_path, 'wb') as file_obj:
             serializer.dump(data, file_obj)
 
-        self.logger.debug('cached data: %s', cache_path)
+        self.logger.debug('Cached data saved at : %s', cache_path)
 
     def cached_data_fresh(self, name, max_age):
         """Whether cache `name` is less than `max_age` seconds old.
@@ -1764,8 +1934,10 @@ class Workflow(object):
         ``query`` is case-insensitive. Any item that does not contain the
         entirety of ``query`` is rejected.
 
-        If ``query`` is an empty string or contains only whitespace,
-        all items will match.
+        .. warning::
+
+            If ``query`` is an empty string or contains only whitespace,
+            a :class:`ValueError` will be raised.
 
         :param query: query to test items against
         :type query: ``unicode``
@@ -1858,13 +2030,13 @@ class Workflow(object):
 
         """
         if not query:
-            return items
+            raise ValueError('Empty `query`')
 
         # Remove preceding/trailing spaces
         query = query.strip()
 
         if not query:
-            return items
+            raise ValueError('`query` contains only whitespace')
 
         # Use user override if there is one
         fold_diacritics = self.settings.get('__workflow_diacritic_folding',
@@ -2044,22 +2216,19 @@ class Workflow(object):
         """
         start = time.time()
 
-        # Write to debugger to ensure "real" output starts on a new line
-        print('.', file=sys.stderr)
-
         # Call workflow's entry function/method within a try-except block
         # to catch any errors and display an error message in Alfred
         try:
+
             if self.version:
-                self.logger.debug('---------- %s (%s) ----------',
-                                  self.name, self.version)
-            else:
-                self.logger.debug('---------- %s ----------', self.name)
+                self.logger.debug(
+                    'Workflow version : {0}'.format(self.version))
 
             # Run update check if configured for self-updates.
             # This call has to go in the `run` try-except block, as it will
             # initialise `self.settings`, which will raise an exception
             # if `settings.json` isn't valid.
+
             if self._update_settings:
                 self.check_update()
 
@@ -2073,7 +2242,8 @@ class Workflow(object):
         except Exception as err:
             self.logger.exception(err)
             if self.help_url:
-                self.logger.info('for assistance, see: %s', self.help_url)
+                self.logger.info(
+                    'For assistance, see: {0}'.format(self.help_url))
 
             if not sys.stdout.isatty():  # Show error in Alfred
                 if text_errors:
@@ -2082,7 +2252,7 @@ class Workflow(object):
                     self._items = []
                     if self._name:
                         name = self._name
-                    elif self._bundleid:  # pragma: no cover
+                    elif self._bundleid:
                         name = self._bundleid
                     else:  # pragma: no cover
                         name = os.path.dirname(__file__)
@@ -2093,8 +2263,8 @@ class Workflow(object):
             return 1
 
         finally:
-            self.logger.debug('---------- finished in %0.3fs ----------',
-                              time.time() - start)
+            self.logger.debug('Workflow finished in {0:0.3f} seconds.'.format(
+                time.time() - start))
 
         return 0
 
@@ -2147,6 +2317,10 @@ class Workflow(object):
             feature (tapping ``SHIFT`` or ``⌘+Y`` on a result).
         :type quicklookurl: ``unicode``
         :returns: :class:`Item` instance
+
+        See the :ref:`script-filter-results` section of the documentation
+        for a detailed description of what the various parameters do and how
+        they interact with one another.
 
         See :ref:`icons` for a list of the supported system icons.
 
@@ -2216,7 +2390,8 @@ class Workflow(object):
 
             self._last_version_run = version
 
-        self.logger.debug('last run version: %s', self._last_version_run)
+        self.logger.debug('Last run version : {0}'.format(
+                          self._last_version_run))
 
         return self._last_version_run
 
@@ -2245,7 +2420,7 @@ class Workflow(object):
 
         self.settings['__workflow_last_version'] = str(version)
 
-        self.logger.debug('set last run version: %s', version)
+        self.logger.debug('Set last run version : {0}'.format(version))
 
         return True
 
@@ -2255,7 +2430,7 @@ class Workflow(object):
 
         .. versionadded:: 1.9
 
-        See :ref:`guide-updates` in the :ref:`user-manual` for detailed
+        See :ref:`manual-updates` in the :ref:`user-manual` for detailed
         information on how to enable your workflow to update itself.
 
         :returns: ``True`` if an update is available, else ``False``
@@ -2266,7 +2441,7 @@ class Workflow(object):
         update_data = Workflow().cached_data('__workflow_update_status',
                                              max_age=0)
 
-        self.logger.debug('update_data: %r', update_data)
+        self.logger.debug('update_data : {0}'.format(update_data))
 
         if not update_data or not update_data.get('available'):
             return False
@@ -2297,7 +2472,7 @@ class Workflow(object):
         The update script will be run in the background, so it won't
         interfere in the execution of your workflow.
 
-        See :ref:`guide-updates` in the :ref:`user-manual` for detailed
+        See :ref:`manual-updates` in the :ref:`user-manual` for detailed
         information on how to enable your workflow to update itself.
 
         :param force: Force update check
@@ -2331,19 +2506,19 @@ class Workflow(object):
             if self.prereleases:
                 cmd.append('--prereleases')
 
-            self.logger.info('checking for update ...')
+            self.logger.info('Checking for update ...')
 
             run_in_background('__workflow_update_check', cmd)
 
         else:
-            self.logger.debug('update check not due')
+            self.logger.debug('Update check not due')
 
     def start_update(self):
         """Check for update and download and install new workflow file.
 
         .. versionadded:: 1.9
 
-        See :ref:`guide-updates` in the :ref:`user-manual` for detailed
+        See :ref:`manual-updates` in the :ref:`user-manual` for detailed
         information on how to enable your workflow to update itself.
 
         :returns: ``True`` if an update is available and will be
@@ -2371,7 +2546,7 @@ class Workflow(object):
         if self.prereleases:
             cmd.append('--prereleases')
 
-        self.logger.debug('downloading update ...')
+        self.logger.debug('Downloading update ...')
         run_in_background('__workflow_update_install', cmd)
 
         return True
@@ -2405,14 +2580,14 @@ class Workflow(object):
         try:
             self._call_security('add-generic-password', service, account,
                                 '-w', password)
-            self.logger.debug('saved password : %s:%s', service, account)
+            self.logger.debug('Saved password : %s:%s', service, account)
 
         except PasswordExists:
-            self.logger.debug('password exists : %s:%s', service, account)
+            self.logger.debug('Password exists : %s:%s', service, account)
             current_password = self.get_password(account, service)
 
             if current_password == password:
-                self.logger.debug('password unchanged')
+                self.logger.debug('Password unchanged')
 
             else:
                 self.delete_password(account, service)
@@ -2455,7 +2630,7 @@ class Workflow(object):
             if h:
                 password = unicode(binascii.unhexlify(h), 'utf-8')
 
-        self.logger.debug('got password : %s:%s', service, account)
+        self.logger.debug('Got password : %s:%s', service, account)
 
         return password
 
@@ -2477,7 +2652,7 @@ class Workflow(object):
 
         self._call_security('delete-generic-password', service, account)
 
-        self.logger.debug('deleted password : %s:%s', service, account)
+        self.logger.debug('Deleted password : %s:%s', service, account)
 
     ####################################################################
     # Methods for workflow:* magic args
@@ -2580,7 +2755,7 @@ class Workflow(object):
             for name in sorted(self.magic_arguments.keys()):
                 if name == 'magic':
                     continue
-                arg = self.magic_prefix + name
+                arg = '{0}{1}'.format(self.magic_prefix, name)
                 self.logger.debug(arg)
 
                 if not isatty:
@@ -2621,7 +2796,7 @@ class Workflow(object):
         """Delete workflow's :attr:`settings_path`."""
         if os.path.exists(self.settings_path):
             os.unlink(self.settings_path)
-            self.logger.debug('deleted : %r', self.settings_path)
+            self.logger.debug('Deleted : %r', self.settings_path)
 
     def reset(self):
         """Delete workflow settings, cache and data.
@@ -2686,7 +2861,7 @@ class Workflow(object):
         standard for Python and will work well with data from the web (via
         :mod:`~workflow.web` or :mod:`json`).
 
-        macOS, on the other hand, uses "NFD" normalisation (nearly), so data
+        OS X, on the other hand, uses "NFD" normalisation (nearly), so data
         coming from the system (e.g. via :mod:`subprocess` or
         :func:`os.listdir`/:mod:`os.path`) may not match. You should either
         normalise this data, too, or change the default normalisation used by
@@ -2758,7 +2933,7 @@ class Workflow(object):
                     shutil.rmtree(path)
                 else:
                     os.unlink(path)
-                self.logger.debug('deleted : %r', path)
+                self.logger.debug('Deleted : %r', path)
 
     def _load_info_plist(self):
         """Load workflow info from ``info.plist``."""
